@@ -64,6 +64,16 @@ if (!sn.result) process.exit(1);
 const sessionId = sn.result.sessionId;
 
 console.log(`[prompt] ${PROMPT}`);
+const MODEL = get("--model");
+if (MODEL) {
+  const setRes = await request("session/set_config_option", {
+    sessionId,
+    configId: "model",
+    value: MODEL,
+    type: "id",
+  });
+  console.log(`[set_config_option ${MODEL}]`, JSON.stringify(setRes.result || setRes.error));
+}
 const t0 = Date.now();
 const result = await request("session/prompt", {
   sessionId,

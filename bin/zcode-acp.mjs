@@ -32,7 +32,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
-const ZCODE_BIN = process.env.ZCODE_ACP_ZCODE_BIN || "zcode";
+const ZCODE_BIN = (() => {
+  if (process.env.ZCODE_ACP_ZCODE_BIN) return process.env.ZCODE_ACP_ZCODE_BIN;
+  // The systemd service's PATH rarely has `zcode`; fall back to the standard
+  // headless wrapper before giving up.
+  for (const dir of (process.env.PATH || "").split(":")) {
+    if (existsSync(join(dir, "zcode"))) return "zcode";
+  }
+  const wrapper = join(process.env.HOME || "", ".zcode", "headless", "zcode-glm");
+  if (existsSync(wrapper)) return wrapper;
+  return "zcode";
+})();
 const TURN_TIMEOUT_MS = Number(process.env.ZCODE_ACP_TURN_TIMEOUT_MS || 0);
 const DEFAULT_MODEL_ID = "zcode-default";
 
@@ -351,6 +361,29 @@ function runLoginFlow() {
 
 // ---------------------------------------------------------------- dispatch
 
+function selectModel(id, params) {
+  const sess = sessions.get(params?.sessionId);
+  if (!sess) {
+    replyError(id, ERR_TURN_FAILED, `unknown session ${params?.sessionId}`);
+    return;
+  }
+  const wanted = params?.modelId;
+  if (typeof wanted !== "string" || !wanted) {
+    replyError(id, ERR_TURN_FAILED, "modelId required");
+    return;
+  }
+  if (wanted !== DEFAULT_MODEL_ID && !splitCompositeModelId(wanted)) {
+    replyError(id, ERR_TURN_FAILED, `unknown model ${wanted} — use "<providerId>::<modelId>" or ${DEFAULT_MODEL_ID}`);
+    return;
+  }
+  sess.model = wanted;
+  notify("session/update", {
+    sessionId: params.sessionId,
+    update: { sessionUpdate: "current_model", currentModelId: sess.model },
+  });
+  reply(id, {});
+}
+
 async function handleRequest(id, method, params) {
   switch (method) {
     case "initialize": {
@@ -390,6 +423,9 @@ async function handleRequest(id, method, params) {
         child: null,
         cancelled: false,
       });
+      // T3's provider probe reads models from a category-"model" select in
+      // configOptions; the in-thread picker reads the models SessionModelState.
+      // Advertise both so snapshot and runtime agree.
       reply(id, {
         sessionId,
         modes: { currentModeId: availableModes[0]?.id || "yolo", availableModes },
@@ -400,6 +436,27 @@ async function handleRequest(id, method, params) {
             ...catalog.availableModels,
           ],
         },
+        ...(catalog.availableModels.length
+          ? {
+              configOptions: [
+                {
+                  configId: "model",
+                  name: "Model",
+                  description: "Model the next ZCode turns run on.",
+                  category: "model",
+                  type: "select",
+                  currentValue: DEFAULT_MODEL_ID,
+                  options: [
+                    { value: DEFAULT_MODEL_ID, name: "ZCode default (provider config)" },
+                    ...catalog.availableModels.map((m) => ({
+                      value: m.modelId,
+                      name: m.name,
+                    })),
+                  ],
+                },
+              ],
+            }
+          : {}),
       });
       return;
     }
@@ -452,26 +509,16 @@ async function handleRequest(id, method, params) {
       return;
     }
     case "session/set_model": {
-      const sess = sessions.get(params?.sessionId);
-      if (!sess) {
-        replyError(id, ERR_TURN_FAILED, `unknown session ${params?.sessionId}`);
+      selectModel(id, params);
+      return;
+    }
+    case "session/set_config_option": {
+      // ACP v2 spelling; T3 sends {sessionId, configId, value, type: "id"}.
+      if (params?.configId && params.configId !== "model") {
+        replyError(id, ERR_TURN_FAILED, `unknown config option ${params.configId}`);
         return;
       }
-      const wanted = params?.modelId;
-      if (typeof wanted !== "string" || !wanted) {
-        replyError(id, ERR_TURN_FAILED, "modelId required");
-        return;
-      }
-      if (wanted !== DEFAULT_MODEL_ID && !splitCompositeModelId(wanted)) {
-        replyError(id, ERR_TURN_FAILED, `unknown model ${wanted} — use "<providerId>::<modelId>" or ${DEFAULT_MODEL_ID}`);
-        return;
-      }
-      sess.model = wanted;
-      notify("session/update", {
-        sessionId: params.sessionId,
-        update: { sessionUpdate: "current_model", currentModelId: sess.model },
-      });
-      reply(id, {});
+      selectModel(id, { sessionId: params?.sessionId, modelId: params?.value });
       return;
     }
     case "session/load": {
@@ -490,7 +537,7 @@ async function handleRequest(id, method, params) {
 // ACP clients and installers probe availability with `--version`; answer on
 // stdout with a dotted triple before touching stdin (the stdio server would
 // otherwise hang waiting for a request that never comes).
-const ADAPTER_VERSION = "0.3.0";
+const ADAPTER_VERSION = "0.4.0";
 if (process.argv.slice(2).some((arg) => arg === "--version" || arg === "-v")) {
   console.log(`zcode-acp ${ADAPTER_VERSION}`);
   process.exit(0);
