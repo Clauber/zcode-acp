@@ -361,6 +361,30 @@ function runLoginFlow() {
 
 // ---------------------------------------------------------------- dispatch
 
+/** Category-"model" select config option (ACP v2). T3's probe derives the
+ *  whole model list from this; the set_config_option reply and the
+ *  config_option_update notification must carry the same full array. */
+function modelConfigOptions(currentModelId) {
+  if (!catalog.availableModels.length) return [];
+  return [
+    {
+      configId: "model",
+      name: "Model",
+      description: "Model the next ZCode turns run on.",
+      category: "model",
+      type: "select",
+      currentValue: currentModelId,
+      options: [
+        { value: DEFAULT_MODEL_ID, name: "ZCode default (provider config)" },
+        ...catalog.availableModels.map((m) => ({
+          value: m.modelId,
+          name: m.name,
+        })),
+      ],
+    },
+  ];
+}
+
 function selectModel(id, params) {
   const sess = sessions.get(params?.sessionId);
   if (!sess) {
@@ -377,39 +401,70 @@ function selectModel(id, params) {
     return;
   }
   sess.model = wanted;
+  const configOptions = modelConfigOptions(sess.model);
   notify("session/update", {
     sessionId: params.sessionId,
-    update: { sessionUpdate: "current_model", currentModelId: sess.model },
+    update: { sessionUpdate: "config_option_update", configOptions },
   });
-  reply(id, {});
+  // set_config_option's v2 reply REQUIRES the full configOptions array;
+  // v1 set_model callers just strip the extra key.
+  reply(id, { configOptions });
 }
 
 async function handleRequest(id, method, params) {
   switch (method) {
     case "initialize": {
-      reply(id, {
-        protocolVersion: 1,
-        agentCapabilities: {
-          loadSession: false,
-          promptCapabilities: { text: true, image: true, embeddedContext: false },
-        },
-        authMethods: [
-          {
-            id: "zcode-login",
-            name: "Z.AI account (zcode login)",
-            description: "Sign in to ZCode via the zcode OAuth flow.",
+      // T3 picks the wire generation from the reply SHAPE, not the echoed
+      // version number: a v2 reply must carry `info` + `capabilities`
+      // (isV2InitializeResponse checks `"info" in response`). Replying in the
+      // v1 shape pins the whole session to v1, where the v1 session/new
+      // decode strips configOptions — so models never reach the probe.
+      const wanted = typeof params?.protocolVersion === "number" ? params.protocolVersion : 1;
+      if (wanted >= 2) {
+        reply(id, {
+          protocolVersion: 2,
+          info: { name: "zcode-acp", title: "ZCode (ACP bridge)", version: ADAPTER_VERSION },
+          capabilities: {},
+          authMethods: [
+            {
+              type: "agent",
+              methodId: "zcode-login",
+              name: "Z.AI account (zcode login)",
+              description: "Sign in to ZCode via the zcode OAuth flow.",
+            },
+          ],
+        });
+      } else {
+        reply(id, {
+          protocolVersion: 1,
+          agentCapabilities: {
+            loadSession: false,
+            promptCapabilities: { text: true, image: true, embeddedContext: false },
           },
-        ],
-      });
+          authMethods: [
+            {
+              id: "zcode-login",
+              name: "Z.AI account (zcode login)",
+              description: "Sign in to ZCode via the zcode OAuth flow.",
+            },
+          ],
+        });
+      }
       return;
     }
-    case "authenticate": {
+    case "authenticate":
+    case "auth/login": {
       if (probeAuthed()) {
         log("authenticate: already signed in");
         reply(id, {});
         return;
       }
       await runLoginFlow();
+      reply(id, {});
+      return;
+    }
+    case "logout":
+    case "auth/logout": {
       reply(id, {});
       return;
     }
@@ -424,8 +479,8 @@ async function handleRequest(id, method, params) {
         cancelled: false,
       });
       // T3's provider probe reads models from a category-"model" select in
-      // configOptions; the in-thread picker reads the models SessionModelState.
-      // Advertise both so snapshot and runtime agree.
+      // configOptions; the in-thread picker reads the models SessionModelState
+      // (v1 only — v2 decodes both away and lives off configOptions).
       reply(id, {
         sessionId,
         modes: { currentModeId: availableModes[0]?.id || "yolo", availableModes },
@@ -436,27 +491,7 @@ async function handleRequest(id, method, params) {
             ...catalog.availableModels,
           ],
         },
-        ...(catalog.availableModels.length
-          ? {
-              configOptions: [
-                {
-                  configId: "model",
-                  name: "Model",
-                  description: "Model the next ZCode turns run on.",
-                  category: "model",
-                  type: "select",
-                  currentValue: DEFAULT_MODEL_ID,
-                  options: [
-                    { value: DEFAULT_MODEL_ID, name: "ZCode default (provider config)" },
-                    ...catalog.availableModels.map((m) => ({
-                      value: m.modelId,
-                      name: m.name,
-                    })),
-                  ],
-                },
-              ],
-            }
-          : {}),
+        configOptions: modelConfigOptions(DEFAULT_MODEL_ID),
       });
       return;
     }
@@ -537,7 +572,7 @@ async function handleRequest(id, method, params) {
 // ACP clients and installers probe availability with `--version`; answer on
 // stdout with a dotted triple before touching stdin (the stdio server would
 // otherwise hang waiting for a request that never comes).
-const ADAPTER_VERSION = "0.4.0";
+const ADAPTER_VERSION = "0.4.1";
 if (process.argv.slice(2).some((arg) => arg === "--version" || arg === "-v")) {
   console.log(`zcode-acp ${ADAPTER_VERSION}`);
   process.exit(0);
