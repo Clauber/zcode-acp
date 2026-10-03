@@ -1,6 +1,6 @@
 {
   "name": "zcode-acp",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "Agent Client Protocol (ACP) adapter exposing the ZCode CLI as an ACP agent over stdio",
   "license": "MIT",
   "type": "module",

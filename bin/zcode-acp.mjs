@@ -10,21 +10,31 @@
 // with `--cwd`, `--mode` and `--attach` mapping from the ACP session state.
 // ZCode persists sessions on disk (sess_* ids), which gives us resume for free.
 //
+// Models: the catalog is read from zcode's personal provider config (the
+// first of ZCODE_ACP_PROVIDER_CONFIG, ZCODE_PERSONAL_PROVIDER_CONFIG_FILE,
+// ~/.zcode/headless/provider_config.json, ~/.zcode/v2/provider_config.json
+// that parses). session/new advertises it as availableModels; session/set_model
+// pins a per-session model, applied per turn by materializing a rotated copy
+// of the provider config (requested provider first, requested model first in
+// its modelOrder) and pointing ZCODE_PERSONAL_PROVIDER_CONFIG_FILE at it.
+// The bare id "zcode-default" keeps the config's own default.
+//
 // Env:
 //   ZCODE_ACP_ZCODE_BIN        zcode executable (default: "zcode" on PATH)
 //   ZCODE_ACP_TURN_TIMEOUT_MS  hard per-turn kill timer (default: 0 = none)
 //   ZCODE_ACP_MODES            comma list to restrict advertised modes
 //   ZCODE_ACP_SKIP_AUTH_CHECK  "1" to treat authenticate as always successful
+//   ZCODE_ACP_PROVIDER_CONFIG  provider config path override for the catalog
 
 import { spawn } from "node:child_process";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
 
 const ZCODE_BIN = process.env.ZCODE_ACP_ZCODE_BIN || "zcode";
 const TURN_TIMEOUT_MS = Number(process.env.ZCODE_ACP_TURN_TIMEOUT_MS || 0);
+const DEFAULT_MODEL_ID = "zcode-default";
 
 // In headless `-p` runs zcode auto-DENIES tool use in every mode except yolo
 // ("No permission client connected"), so only yolo is advertised by default.
@@ -52,8 +62,127 @@ const ERR_TURN_FAILED = -32000;
 
 // ---------------------------------------------------------------- sessions
 
-/** @type {Map<string, {cwd:string, mode:string, zcodeSession:string|null, child:import('child_process').ChildProcess|null, cancelled:boolean}>} */
+/** @type {Map<string, {cwd:string, mode:string, model:string|null, zcodeSession:string|null, child:import('child_process').ChildProcess|null, cancelled:boolean}>} */
 const sessions = new Map();
+
+// Provider-config model catalog, re-read per turn basis but cached for the
+// advertisement; session/set_model re-validates against a fresh read.
+const catalog = loadCatalog();
+
+// ---------------------------------------------------------------- models
+
+// Composite model id: `<providerId>::<modelId>`. Provider ids may contain
+// slashes (9router rows like cc/claude-opus-5), so "::" is the separator.
+function compositeModelId(providerId, modelId) {
+  return `${providerId}::${modelId}`;
+}
+
+function splitCompositeModelId(id) {
+  const idx = typeof id === "string" ? id.indexOf("::") : -1;
+  if (idx <= 0) return null;
+  return { providerId: id.slice(0, idx), modelId: id.slice(idx + 2) };
+}
+
+function providerConfigCandidates() {
+  // Desktop config first: it carries every provider the ZCode app offers
+  // (with their access blocks), so the model list matches what the user sees
+  // there. The explicit override wins; the wrapper's headless config is the
+  // last resort.
+  return [
+    process.env.ZCODE_ACP_PROVIDER_CONFIG,
+    join(process.env.HOME || "", ".zcode", "v2", "provider_config.json"),
+    process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE,
+    join(process.env.HOME || "", ".zcode", "headless", "provider_config.json"),
+  ].filter(Boolean);
+}
+
+function readProviderConfig() {
+  for (const path of providerConfigCandidates()) {
+    try {
+      const parsed = JSON.parse(readFileSync(path, "utf8"));
+      const config = parsed?.config ?? parsed;
+      if (config && typeof config === "object") {
+        return { path, schemaVersion: parsed?.schemaVersion ?? 1, config };
+      }
+    } catch {
+      // missing or unparseable — try the next candidate
+    }
+  }
+  return null;
+}
+
+function providerModelEntries(config) {
+  const rules = Array.isArray(config?.providerConfigRules?.providerRules)
+    ? config.providerConfigRules.providerRules
+    : [];
+  const byId = new Map();
+  for (const rule of rules) {
+    if (typeof rule?.providerId !== "string" || !rule.providerId) continue;
+    // The model lists hang off the rule's own config block (same shape in the
+    // headless and desktop provider configs).
+    const inner = rule.config && typeof rule.config === "object" ? rule.config : {};
+    const models = Array.isArray(inner.modelOrder) && inner.modelOrder.length
+      ? inner.modelOrder
+      : (Array.isArray(inner.personalModelIds) ? inner.personalModelIds : []);
+    const clean = models.filter((m) => typeof m === "string" && m);
+    if (clean.length) byId.set(rule.providerId, clean);
+  }
+  const order = [
+    ...(Array.isArray(config?.providerOrder) ? config.providerOrder : []),
+    ...[...byId.keys()],
+  ].filter((id, i, all) => typeof id === "string" && byId.has(id) && all.indexOf(id) === i);
+  const entries = [];
+  for (const providerId of order) {
+    for (const modelId of byId.get(providerId)) entries.push({ providerId, modelId });
+  }
+  return entries;
+}
+
+function loadCatalog() {
+  const source = readProviderConfig();
+  const entries = source ? providerModelEntries(source.config) : [];
+  return {
+    entries,
+    availableModels: entries.map(({ providerId, modelId }) => ({
+      modelId: compositeModelId(providerId, modelId),
+      name: `${modelId} · ${providerId}`,
+    })),
+  };
+}
+
+/** Materialize a rotated provider config so `zcode -p` runs the requested
+ *  model: its provider first in providerOrder, the model first in that
+ *  provider's modelOrder/personalModelIds. Zcode picks the session default
+ *  from exactly that order. Returns the temp file path; caller removes it. */
+function materializeModelConfig(source, wanted) {
+  const parts = splitCompositeModelId(wanted);
+  if (!parts) return null;
+  const { providerId, modelId } = parts;
+  const sourceConfig = source.config;
+  const rules = Array.isArray(sourceConfig?.providerConfigRules?.providerRules)
+    ? sourceConfig.providerConfigRules.providerRules
+    : [];
+  const rule = rules.find((r) => r?.providerId === providerId);
+  if (!rule) return null;
+  // The model lists hang off the rule's own config block.
+  const inner = rule.config && typeof rule.config === "object" ? rule.config : {};
+  const own = Array.isArray(inner.modelOrder) && inner.modelOrder.includes(modelId)
+    ? inner.modelOrder
+    : (Array.isArray(inner.personalModelIds) ? inner.personalModelIds : null);
+  if (!own || !own.includes(modelId)) return null;
+  const next = structuredClone(sourceConfig);
+  const nextInner = next.providerConfigRules.providerRules.find((r) => r?.providerId === providerId).config;
+  if (Array.isArray(nextInner.modelOrder)) nextInner.modelOrder = [modelId, ...nextInner.modelOrder.filter((m) => m !== modelId)];
+  if (Array.isArray(nextInner.personalModelIds)) nextInner.personalModelIds = [modelId, ...nextInner.personalModelIds.filter((m) => m !== modelId)];
+  const order = Array.isArray(next.providerOrder) ? next.providerOrder.filter((id) => id !== providerId) : [];
+  next.providerOrder = [providerId, ...order];
+  // Written back as the full wrapper — schemaVersion included, or zcode
+  // rejects the file and the turn dies in model creation.
+  const dir = mkdtempSync(join(tmpdir(), "zcode-acp-model-"));
+  const file = join(dir, "provider_config.json");
+  writeFileSync(file, JSON.stringify({ schemaVersion: source.schemaVersion, config: next }, null, 2));
+  return file;
+}
 
 // ---------------------------------------------------------------- zcode run
 
@@ -85,14 +214,33 @@ function runTurn(sess, promptBlocks) {
       return;
     }
 
-    const argv = [ZCODE_BIN, "-p", text, "--json", "--cwd", sess.cwd, "--mode", sess.mode];
+    // No ZCODE_BIN in argv: spawn(command, args) already sets argv0, and a
+    // duplicated binary name reaches zcode as a stray positional that breaks
+    // its provider-config validation ("路径必须同时提供").
+    const argv = ["-p", text, "--json", "--cwd", sess.cwd, "--mode", sess.mode];
     for (const file of attachPaths) argv.push("--attach", file);
     if (sess.zcodeSession) argv.push("--resume", sess.zcodeSession);
 
-    log(`turn start: mode=${sess.mode} resume=${sess.zcodeSession || "new"} attach=${attachPaths.length}`);
+    // A pinned composite model rides a rotated provider config copy for this
+    // turn only; "zcode-default" keeps the config's own default.
+    let modelConfigFile = null;
+    const childEnv = { ...process.env };
+    if (sess.model && sess.model !== DEFAULT_MODEL_ID) {
+      const source = readProviderConfig();
+      if (source) {
+        modelConfigFile = materializeModelConfig(source, sess.model);
+        if (modelConfigFile) {
+          childEnv.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE = modelConfigFile;
+        } else {
+          log(`model ${sess.model} not found in provider config — running the config default`);
+        }
+      }
+    }
+
+    log(`turn start: mode=${sess.mode} model=${sess.model || DEFAULT_MODEL_ID} resume=${sess.zcodeSession || "new"} attach=${attachPaths.length}`);
     const child = spawn(ZCODE_BIN, argv, {
       stdio: ["ignore", "pipe", "pipe"],
-      env: process.env,
+      env: childEnv,
     });
     sess.child = child;
     sess.cancelled = false;
@@ -115,6 +263,9 @@ function runTurn(sess, promptBlocks) {
     const done = (result) => {
       if (timeout) clearTimeout(timeout);
       sess.child = null;
+      if (modelConfigFile) {
+        try { rmSync(join(modelConfigFile, ".."), { recursive: true, force: true }); } catch {}
+      }
       for (const file of attachPaths) {
         try { rmSync(join(file, ".."), { recursive: true, force: true }); } catch {}
       }
@@ -234,6 +385,7 @@ async function handleRequest(id, method, params) {
       sessions.set(sessionId, {
         cwd: params?.cwd || process.cwd(),
         mode: availableModes[0]?.id || "yolo",
+        model: null,
         zcodeSession: null,
         child: null,
         cancelled: false,
@@ -241,6 +393,13 @@ async function handleRequest(id, method, params) {
       reply(id, {
         sessionId,
         modes: { currentModeId: availableModes[0]?.id || "yolo", availableModes },
+        models: {
+          currentModelId: DEFAULT_MODEL_ID,
+          availableModels: [
+            { modelId: DEFAULT_MODEL_ID, name: "ZCode default (provider config)" },
+            ...catalog.availableModels,
+          ],
+        },
       });
       return;
     }
@@ -293,7 +452,26 @@ async function handleRequest(id, method, params) {
       return;
     }
     case "session/set_model": {
-      replyError(id, ERR_METHOD_NOT_FOUND, "model switching is not supported by zcode-acp v1");
+      const sess = sessions.get(params?.sessionId);
+      if (!sess) {
+        replyError(id, ERR_TURN_FAILED, `unknown session ${params?.sessionId}`);
+        return;
+      }
+      const wanted = params?.modelId;
+      if (typeof wanted !== "string" || !wanted) {
+        replyError(id, ERR_TURN_FAILED, "modelId required");
+        return;
+      }
+      if (wanted !== DEFAULT_MODEL_ID && !splitCompositeModelId(wanted)) {
+        replyError(id, ERR_TURN_FAILED, `unknown model ${wanted} — use "<providerId>::<modelId>" or ${DEFAULT_MODEL_ID}`);
+        return;
+      }
+      sess.model = wanted;
+      notify("session/update", {
+        sessionId: params.sessionId,
+        update: { sessionUpdate: "current_model", currentModelId: sess.model },
+      });
+      reply(id, {});
       return;
     }
     case "session/load": {
@@ -308,6 +486,15 @@ async function handleRequest(id, method, params) {
 }
 
 // ---------------------------------------------------------------- main loop
+
+// ACP clients and installers probe availability with `--version`; answer on
+// stdout with a dotted triple before touching stdin (the stdio server would
+// otherwise hang waiting for a request that never comes).
+const ADAPTER_VERSION = "0.3.0";
+if (process.argv.slice(2).some((arg) => arg === "--version" || arg === "-v")) {
+  console.log(`zcode-acp ${ADAPTER_VERSION}`);
+  process.exit(0);
+}
 
 let buffer = "";
 process.stdin.setEncoding("utf8");
@@ -344,4 +531,4 @@ process.stdin.on("end", () => {
   process.exit(0);
 });
 
-log(`ready (zcode=${ZCODE_BIN}, modes=${availableModes.map((m) => m.id).join(",")})`);
+log(`ready (zcode-acp ${ADAPTER_VERSION}, zcode=${ZCODE_BIN}, modes=${availableModes.map((m) => m.id).join(",")})`);
